@@ -1,5 +1,5 @@
 -- COPY ALL OF THIS INTO YOUR ROBLOX SCRIPT --
-{
+return{
     ["2026 bunny"] = {"Medium", 0},
     ["shiny 2026 bunny"] = {"Medium", 0},
     ["shiny xl 2026 bunny"] = {"Medium", 0},

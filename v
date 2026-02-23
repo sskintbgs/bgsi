@@ -1,10 +1,12 @@
 -- Demonscan_master_scanner_v23.13.lua - Live Stats, Custom Filters, & Safe Webhooks
--- Updated: Pending mapper now cleans already-mapped pets before syncing
+-- Updated: Custom Lua Table Parser for external JSON files
 local Rayfield = loadstring(game:HttpGet('https://sirius.menu/rayfield'))()
 local requestFunc = request or http_request or syn.request or http.request or fluxus.request or getgenv().request
 if not requestFunc then warn("[-] No HTTP request function!") return end
+
 -- Safe Clipboard Wrapper
 local safeClipboard = setclipboard or toclipboard or set_clipboard or (Clipboard and Clipboard.set) or function() warn("Clipboard not supported on this executor.") end
+
 -- Services & Remotes
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local Players = game:GetService("Players")
@@ -13,16 +15,19 @@ local TeleportService = game:GetService("TeleportService")
 local CoreGui = game:GetService("CoreGui")
 local RemoteFunction = ReplicatedStorage:WaitForChild("Shared"):WaitForChild("Framework"):WaitForChild("Network"):WaitForChild("Remote"):WaitForChild("RemoteFunction")
 local RemoteEvent = ReplicatedStorage:WaitForChild("Shared"):WaitForChild("Framework"):WaitForChild("Network"):WaitForChild("Remote"):WaitForChild("RemoteEvent")
+
 -- Files & Globals
 local CACHE_FILE = "bgsi_global_v56.json"
 local HISTORY_FILE = "bgsi_scan_history.json"
 local SHARK_FILE = "shark_pets.json"
 local SETTINGS_FILE = "bgsi_settings.json"
 local UNMAPPED_FILE = "bgsi_unmapped.json"
+
 local petCache = {}
 local scanHistory = {}
 local sharkList = {}  
 local pendingUnmappedSet = {}
+
 -- State Variables
 local sharkEnabled = false
 local isScanning = false
@@ -37,6 +42,7 @@ local showExtraWebhookInfo = false
 local apiSyncDelay = 0.05
 local webhookMinValue = 10000 -- Default minimum value for webhook lists
 local isUiLoaded = false
+
 -- Lifetime Stats Variables
 local totalPetsScannedLifetime = 0
 local totalPeopleScannedLifetime = 0
@@ -44,7 +50,8 @@ local totalServersJoinedLifetime = 0
 local adminWebhookUrl = ""
 local adminWebhookMessageId = ""
 local adminLiveStatsEnabled = false
--- Data Loading
+
+-- Data Loading (Standard JSON)
 local function loadJSON(file)
     if isfile(file) then
         local s, c = pcall(readfile, file)
@@ -55,10 +62,60 @@ local function loadJSON(file)
     end
     return {}
 end
-petCache = loadJSON(CACHE_FILE)
+
+-- Data Loading (Custom Parser for Pet Cache allowing Lua Syntax)
+local function loadPetCache(file)
+    if isfile(file) then
+        local s, c = pcall(readfile, file)
+        if s and c then
+            -- 1. Try standard JSON decode first
+            local dOk, loaded = pcall(HttpService.JSONDecode, HttpService, c)
+            if dOk and type(loaded) == "table" then return loaded end
+            
+            -- 2. Fallback: Parse raw Lua table syntax if user pasted it directly
+            local parseStr = "local data = " .. c .. "\nreturn data"
+            local func = loadstring(parseStr)
+            if func then
+                local lOk, luaTable = pcall(func)
+                if lOk and type(luaTable) == "table" then
+                    return luaTable
+                end
+            end
+        end
+    end
+    return {}
+end
+
+local function formatPetCache(rawTable)
+    local formatted = {}
+    for k, v in pairs(rawTable) do
+        local key = tostring(k):lower()
+        if type(v) == "table" then
+            if v[1] and v[2] ~= nil then
+                -- Handled pasted format: {"Rarity", Value}
+                formatted[key] = {
+                    apiRarity = tostring(v[1]),
+                    value = tonumber(v[2]) or 0,
+                    eggType = "Unknown"
+                }
+            else
+                -- Standard JSON format
+                formatted[key] = {
+                    value = tonumber(v.value) or tonumber(v.numericValue) or 0,
+                    apiRarity = v.apiRarity or "Unknown",
+                    eggType = v.eggType or "Unknown"
+                }
+            end
+        end
+    end
+    return formatted
+end
+
+petCache = formatPetCache(loadPetCache(CACHE_FILE))
 scanHistory = loadJSON(HISTORY_FILE)
 sharkList = loadJSON(SHARK_FILE)
 pendingUnmappedSet = loadJSON(UNMAPPED_FILE)
+
 -- Load Settings
 local savedSettings = loadJSON(SETTINGS_FILE)
 webhookUrl = savedSettings.webhookUrl or ""
@@ -77,6 +134,7 @@ totalServersJoinedLifetime = savedSettings.totalServersJoinedLifetime or 0
 adminWebhookUrl = savedSettings.adminWebhookUrl or ""
 adminWebhookMessageId = savedSettings.adminWebhookMessageId or ""
 adminLiveStatsEnabled = savedSettings.adminLiveStatsEnabled or false
+
 local function saveData()
     if writefile then
         pcall(writefile, CACHE_FILE, HttpService:JSONEncode(petCache))
@@ -103,6 +161,7 @@ local function saveData()
         }))
     end
 end
+
 -- ScreenGui HUD Setup
 local hudGui = Instance.new("ScreenGui")
 hudGui.Name = "BGSIScannerHUD"
@@ -128,12 +187,14 @@ uiCorner.CornerRadius = UDim.new(0, 8)
 local uiStroke = Instance.new("UIStroke", statusLabel)
 uiStroke.Color = Color3.fromRGB(60, 60, 60)
 uiStroke.Thickness = 1
+
 local function SetStatus(text, showHud)
     if statusLabel then
         statusLabel.Text = "📡 " .. text
         statusLabel.Visible = showHud or false
     end
 end
+
 -- Statistics & Utility
 local function getDatabaseStats()
     local count, secrets, exclusives = 0, 0, 0
@@ -144,6 +205,7 @@ local function getDatabaseStats()
     end
     return count, secrets, exclusives
 end
+
 local function stripPrefixes(name)
     local cleaned = tostring(name or ""):lower()
     local prefixes = {"shiny mythic xl ", "shiny mythic ", "mythic xl ", "shiny xl ", "shiny ", "mythic ", "xl ", "shiny giftbox ", "giftbox ", "og ", "vip ", ""}
@@ -153,16 +215,17 @@ local function stripPrefixes(name)
     end
     return cleaned
 end
+
 -- Formatting
 local function formatInventoryForClipboard(name)
     local data = scanHistory[name]
     if not data or not data.map then return "No data found for " .. name end
-   
+    
     local lines = {"--- INVENTORY: " .. name .. " (" .. (data.date or "Unknown") .. ") ---"}
     local totalVal = 0
     local totalPetsCount = 0
     local petEntries = {}
-   
+    
     for petName, amount in pairs(data.map) do
         local info = petCache[petName] or {value = 0}
         local petValue = tonumber(info.value) or 0
@@ -175,18 +238,19 @@ local function formatInventoryForClipboard(name)
         totalVal = totalVal + totalForPet
         totalPetsCount = totalPetsCount + amount
     end
-   
+    
     table.sort(petEntries, function(a, b)
         if a.totalValue ~= b.totalValue then return a.totalValue > b.totalValue end
         return a.amount > b.amount
     end)
-   
+    
     for _, entry in ipairs(petEntries) do table.insert(lines, entry.display) end
     table.insert(lines, "──────────────────────────────")
     table.insert(lines, "TOTAL PETS: " .. totalPetsCount)
     table.insert(lines, "TOTAL INVENTORY VALUE: " .. totalVal)
     return table.concat(lines, "\n")
 end
+
 -- API Sync Functions
 local function fetchApi(url)
     local ok, resp = pcall(requestFunc, {Url = url, Method = "GET", Headers = {Accept = "application/json", Referer = "https://www.bgsi.gg/", Origin = "https://www.bgsi.gg"}})
@@ -196,6 +260,7 @@ local function fetchApi(url)
     end
     return nil
 end
+
 local function processPet(obj)
     if not obj or not obj.id then return 0 end
     local key = tostring(obj.name):lower()
@@ -207,6 +272,7 @@ local function processPet(obj)
     }
     return isNew
 end
+
 local function syncVariants(baseName)
     local slugVariations = {}
     local cleaned = stripPrefixes(baseName):gsub("%s+", "-"):gsub("[^%w%-]", ""):lower()
@@ -214,7 +280,7 @@ local function syncVariants(baseName)
     table.insert(slugVariations, (cleaned:gsub("-", "")))
     table.insert(slugVariations, (cleaned:gsub("'", "")))
     table.insert(slugVariations, (cleaned:gsub("-", "_")))
-   
+    
     for _, slug in ipairs(slugVariations) do
         local data = fetchApi("https://api.bgsi.gg/api/items/" .. slug)
         if data and data.pet then
@@ -228,14 +294,15 @@ local function syncVariants(baseName)
     end
     return false, 0
 end
+
 -- Admin Webhook Editor (Edits 1 Message safely)
 local function UpdateAdminWebhook()
     if not adminLiveStatsEnabled or adminWebhookUrl == "" then return end
-   
+    
     -- Strips query parameters (like ?wait=true) off the base URL so PATCH works
     local cleanUrl = string.match(adminWebhookUrl, "^([^%?]+)")
     if not cleanUrl then return end
-   
+    
     local embed = {
         title = "📊 Demonscan Global Stats (Live)",
         color = 3447003,
@@ -282,6 +349,7 @@ local function UpdateAdminWebhook()
         end
     end)
 end
+
 -- UI Creation & Logic Hooks
 local Window = Rayfield:CreateWindow({
     Name = "DemonScan v23.13",
@@ -295,6 +363,7 @@ local StatsTab = Window:CreateTab("Stats", 4483362458)
 local HistoryTab = Window:CreateTab("History", 4483362458)
 local DBTab = Window:CreateTab("Database", 4483362458)
 local MiscTab = Window:CreateTab("Misc", 4483362458)
+
 -- UI Helpers (Stats)
 local StatsPetsLabel = StatsTab:CreateLabel("Total Pets Scanned: " .. totalPetsScannedLifetime)
 local StatsPlayersLabel = StatsTab:CreateLabel("Total Players Scanned: " .. totalPeopleScannedLifetime)
@@ -304,6 +373,7 @@ local function UpdateStatsUI()
     if StatsPlayersLabel then StatsPlayersLabel:Set("Total Players Scanned: " .. totalPeopleScannedLifetime) end
     if StatsServersLabel then StatsServersLabel:Set("Total Servers Joined: " .. totalServersJoinedLifetime) end
 end
+
 StatsTab:CreateSection("Admin Live Stats Webhook")
 StatsTab:CreateInput({
     Name = "Admin Webhook URL",
@@ -336,6 +406,7 @@ StatsTab:CreateButton({
         UpdateAdminWebhook()
     end
 })
+
 -- UI Helpers (Others)
 local PendingPetsLabel = nil
 local function UpdatePendingCounter()
@@ -344,6 +415,7 @@ local function UpdatePendingCounter()
     for _ in pairs(pendingUnmappedSet) do count = count + 1 end
     PendingPetsLabel:Set("Pending Unmapped Pets: " .. count)
 end
+
 local DBStatsLabel = nil
 local function refreshDBLabel()
     if DBStatsLabel then
@@ -351,13 +423,16 @@ local function refreshDBLabel()
         DBStatsLabel:Set("Database: " .. c .. " pets | " .. s .. " secrets | " .. e .. " exclusives")
     end
 end
+
 local ScanCounterLabel = ScanTab:CreateLabel("Scanned: 0 / 0")
 local function updateScanCounter(scanned, total)
     ScanCounterLabel:Set("Scanned: " .. scanned .. " / " .. total)
 end
+
 local SelectedLive = nil
 local SelectedHistory = nil
 local PlayerDrop, HistDrop
+
 local function refreshUI()
     local p, h = {}, {}
     for _, plr in ipairs(Players:GetPlayers()) do table.insert(p, plr.Name) end
@@ -367,9 +442,11 @@ local function refreshUI()
     if HistDrop then HistDrop:Refresh(h, true) end
     refreshDBLabel()
 end
+
 task.spawn(refreshUI)
 Players.PlayerAdded:Connect(refreshUI)
 Players.PlayerRemoving:Connect(refreshUI)
+
 -- Server Hopper Function
 local function hopServer()
     SetStatus("Hopping to new server...", true)
@@ -377,7 +454,7 @@ local function hopServer()
     local currentJobId = game.JobId
     local apiUrl = "https://games.roblox.com/v1/games/" .. placeId .. "/servers/Public?sortOrder=Asc&limit=100"
     local success, response = pcall(function() return HttpService:JSONDecode(game:HttpGet(apiUrl)) end)
-   
+    
     if success and response and response.data then
         local available = {}
         for _, server in ipairs(response.data) do
@@ -398,6 +475,7 @@ local function hopServer()
         SetStatus("Status: Idle", false)
     end
 end
+
 -- Scanner Core
 local function countTotalPets(t)
     local count = 0
@@ -409,19 +487,20 @@ local function countTotalPets(t)
     recurse(t)
     return count
 end
+
 function RunScanner(playersToScan)
     if isScanning then return end
     isScanning = true
-   
+    
     local toScan = {}
     for _, plr in ipairs(playersToScan) do
         if not skipAlreadyScanned or not scanHistory[plr.Name] then table.insert(toScan, plr) end
     end
-   
+    
     local totalToScan = #toScan
     local scannedCount = 0
     updateScanCounter(scannedCount, totalToScan)
-   
+    
     if totalToScan == 0 then
         SetStatus("Nothing to scan (all already done)", true)
         task.wait(2)
@@ -430,27 +509,27 @@ function RunScanner(playersToScan)
         if autoHop then hopServer() end
         return
     end
-   
+    
     local syncQueue = {}
     local newPetsFound = 0
-   
+    
     for i, plr in ipairs(toScan) do
         SetStatus("Scanning " .. plr.Name .. " (" .. i .. "/" .. totalToScan .. ")", true)
-       
+        
         local success, result = pcall(function() return RemoteFunction:InvokeServer("TradeViewInventory", plr) end)
-       
+        
         if not success or not result then
             SetStatus("Failed to scan " .. plr.Name, true)
             scannedCount = scannedCount + 1
             updateScanCounter(scannedCount, totalToScan)
-           
+            
             if i < totalToScan then
                 SetStatus("Delaying 4s...", true)
                 task.wait(4)
             end
             continue
         end
-       
+        
         local map = {}
         if sharkEnabled then
             local function fastExtract(t)
@@ -458,7 +537,7 @@ function RunScanner(playersToScan)
                 if t.Name and t.XP then
                     local fullName = ((t.Shiny and "shiny " or "") .. (t.Mythic and "mythic " or "") .. (t.XL and "xl " or "") .. t.Name):lower()
                     map[fullName] = (map[fullName] or 0) + (tonumber(t.Amount) or 1)
-                   
+                    
                     if not petCache[fullName] or petCache[fullName].value == 0 then
                         if not pendingUnmappedSet[t.Name] then
                             pendingUnmappedSet[t.Name] = true
@@ -474,18 +553,18 @@ function RunScanner(playersToScan)
         else
             local totalPets = countTotalPets(result)
             local processed = 0
-           
+            
             local function extract(t)
                 if type(t) ~= "table" then return end
                 if t.Name and t.XP then
                     local fullName = ((t.Shiny and "shiny " or "") .. (t.Mythic and "mythic " or "") .. (t.XL and "xl " or "") .. t.Name):lower()
                     map[fullName] = (map[fullName] or 0) + (tonumber(t.Amount) or 1)
-                   
+                    
                     if not petCache[fullName] or petCache[fullName].value == 0 then
                         syncQueue[t.Name] = true
                         newPetsFound = newPetsFound + 1
                     end
-                   
+                    
                     task.wait(0.005)
                     processed = processed + 1
                     local percent = math.floor((processed / totalPets) * 100 + 0.5)
@@ -497,6 +576,7 @@ function RunScanner(playersToScan)
             extract(result)
             scanHistory[plr.Name] = {map = map, date = os.date("%Y-%m-%d %H:%M:%S")}
         end
+        
         -- Execute Lifetime Tracking immediately after scanning map is generated
         local petsThisScan = 0
         for _, amount in pairs(map) do petsThisScan = petsThisScan + amount end
@@ -505,7 +585,7 @@ function RunScanner(playersToScan)
         saveData()
         UpdateStatsUI()
         UpdateAdminWebhook()
-       
+        
         if sharkEnabled then
             local foundSharks = {}
             for _, targetPet in ipairs(sharkList) do
@@ -514,21 +594,21 @@ function RunScanner(playersToScan)
                     table.insert(foundSharks, {name = targetPet:upper(), amount = amount})
                 end
             end
-           
+            
             if #foundSharks > 0 then
                 local playerName = plr.Name
                 local jobId = game.JobId
                 local placeId = game.PlaceId
                 local profileUrl = "https://www.roblox.com/users/" .. plr.UserId .. "/profile"
                 local joinLink = "https://www.roblox.com/games/start?placeId=" .. placeId .. "&gameInstanceId=" .. jobId
-               
+                
                 local sharkDesc = ""
                 for _, s in ipairs(foundSharks) do
                     sharkDesc = sharkDesc .. s.amount .. "x **" .. s.name .. "**\n"
                 end
-               
+                
                 Rayfield:Notify({Title = "Demonscan Flag!", Content = playerName .. " has:\n" .. sharkDesc, Duration = 10})
-               
+                
                 if webhookUrl ~= "" then
                     local embedsArray = {}
                     local embedFields = {
@@ -536,32 +616,32 @@ function RunScanner(playersToScan)
                         {name = "Place ID", value = tostring(placeId), inline = true},
                         {name = "Direct Join", value = "[Click to Join](" .. joinLink .. ")", inline = false}
                     }
-                   
+                    
                     local secFiltered = {}
                     local excFiltered = {}
                     local legFiltered = {}
-                   
+                    
                     if showExtraWebhookInfo then
                         local totalVal = 0
                         local totalSec = 0
                         local totalLeg = 0
                         local totalExc = 0
                         local totalPetsScanned = 0
-                       
+                        
                         for petName, amount in pairs(map) do
                             local info = petCache[petName] or {value = 0, apiRarity = "Unknown", eggType = "Unknown"}
                             local val = tonumber(info.value) or 0
-                           
+                            
                             totalVal = totalVal + (val * amount)
                             totalPetsScanned = totalPetsScanned + amount
-                           
+                            
                             if info.apiRarity == "Secret" then
                                 totalSec = totalSec + amount
                                 if val >= webhookMinValue then
                                     table.insert(secFiltered, amount .. "x " .. petName:upper() .. " (Val: " .. val .. ")")
                                 end
                             end
-                           
+                            
                             if info.apiRarity == "Legendary" then
                                 totalLeg = totalLeg + amount
                                 if val >= webhookMinValue then
@@ -575,14 +655,14 @@ function RunScanner(playersToScan)
                                 end
                             end
                         end
-                       
+                        
                         table.insert(embedFields, {name = "🐾 Total Pets", value = tostring(totalPetsScanned), inline = true})
                         table.insert(embedFields, {name = "💰 Total Inv Value", value = tostring(totalVal), inline = true})
                         table.insert(embedFields, {name = "✨ Total Secrets", value = tostring(totalSec), inline = true})
                         table.insert(embedFields, {name = "🟡 Total Legendaries", value = tostring(totalLeg), inline = true})
                         table.insert(embedFields, {name = "🟣 Total Exclusives", value = tostring(totalExc), inline = true})
                     end
-                   
+                    
                     local currentEmbed = {
                         title = "🚨 Flagged PET DETECTED!",
                         description = "**Player:** [" .. playerName .. "](" .. profileUrl .. ")\n**Has:**\n" .. sharkDesc,
@@ -591,7 +671,7 @@ function RunScanner(playersToScan)
                         footer = {text = "Demonscan • " .. os.date("%Y-%m-%d %H:%M:%S")},
                         timestamp = os.date("!%Y-%m-%dT%H:%M:%SZ")
                     }
-                   
+                    
                     local function addSafeField(name, val)
                         if #currentEmbed.fields >= 25 then
                             table.insert(embedsArray, currentEmbed)
@@ -623,15 +703,15 @@ function RunScanner(playersToScan)
                         local secChunks = chunkList(secFiltered, 1000)
                         local legChunks = chunkList(legFiltered, 1000)
                         local excChunks = chunkList(excFiltered, 1000)
-                       
+                        
                         local threshStr = (webhookMinValue >= 1000 and (webhookMinValue / 1000) .. "k" or tostring(webhookMinValue))
                         for i, chunk in ipairs(secChunks) do addSafeField(i == 1 and "🔴 Secrets >" .. threshStr or "🔴 Secrets >" .. threshStr .. " (Cont.)", chunk) end
                         for i, chunk in ipairs(legChunks) do addSafeField(i == 1 and "🟡 Legendaries >" .. threshStr or "🟡 Legendaries >" .. threshStr .. " (Cont.)", chunk) end
                         for i, chunk in ipairs(excChunks) do addSafeField(i == 1 and "🟣 Exclusives >" .. threshStr or "🟣 Exclusives >" .. threshStr .. " (Cont.)", chunk) end
                     end
-                   
+                    
                     table.insert(embedsArray, currentEmbed)
-                   
+                    
                     local function sendEmbeds(embedGroup)
                         pcall(function()
                             requestFunc({
@@ -643,7 +723,7 @@ function RunScanner(playersToScan)
                             })
                         end)
                     end
-                   
+                    
                     local currentPayload = {}
                     for _, emb in ipairs(embedsArray) do
                         table.insert(currentPayload, emb)
@@ -659,24 +739,24 @@ function RunScanner(playersToScan)
                 end
             end
         end
-       
+        
         scannedCount = scannedCount + 1
         updateScanCounter(scannedCount, totalToScan)
-       
+        
         if i < totalToScan then
             SetStatus("Delaying 4s for " .. plr.Name .. "'s inventory...", true)
             task.wait(4)
         end
     end
-   
+    
     if newPetsFound > 0 then
         Rayfield:Notify({Title = "API Queue Update", Content = newPetsFound .. " new/missing-value pets queued for sync.", Duration = 5})
     end
-   
+    
     -- Processing API Queue
     local qList = {}
     for base in pairs(syncQueue) do table.insert(qList, base) end
-   
+    
     if #qList > 0 then
         SetStatus("Syncing " .. #qList .. " pets via API...", true)
         local totalAdded = 0
@@ -689,17 +769,18 @@ function RunScanner(playersToScan)
             task.wait(apiSyncDelay)
         end
     end
-   
+    
     saveData()
     refreshUI()
     SetStatus("Status: Idle", false)
     isScanning = false
-   
+    
     if autoHop then
         task.wait(1)
         hopServer()
     end
 end
+
 -- ===========================
 -- SCANNER TAB
 -- ===========================
@@ -709,6 +790,7 @@ ScanTab:CreateButton({Name = "Scan Entire Server", Callback = function() RunScan
 ScanTab:CreateToggle({Name = "Auto-Scan Server On Join/Execute (AFK)", CurrentValue = autoScanOnJoin, Callback = function(v) autoScanOnJoin = v; saveData(); end})
 ScanTab:CreateToggle({Name = "Auto-Scan New Joins", CurrentValue = autoScanNewJoins, Callback = function(v) autoScanNewJoins = v; saveData(); end})
 ScanTab:CreateToggle({Name = "Skip Already Scanned", CurrentValue = skipAlreadyScanned, Callback = function(v) skipAlreadyScanned = v; saveData(); end})
+
 -- ===========================
 -- SHARKING TAB
 -- ===========================
@@ -733,6 +815,7 @@ SharkTab:CreateButton({
     end
 })
 SharkTab:CreateButton({ Name = "Clear Shark List", Callback = function() sharkList = {}; saveData(); updateSharkLabel() end })
+
 SharkTab:CreateSection("Sharking Settings")
 SharkTab:CreateInput({Name = "Discord Webhook URL", CurrentValue = webhookUrl, PlaceholderText = "https://discord.com/api/webhooks/...", Callback = function(v) webhookUrl = v; saveData(); end})
 SharkTab:CreateToggle({
@@ -764,6 +847,7 @@ SharkTab:CreateToggle({
         end
     end
 })
+
 SharkTab:CreateSection("Webhook Value Filter")
 SharkTab:CreateSlider({
     Name = "Min Webhook Pet Value",
@@ -789,6 +873,7 @@ SharkTab:CreateInput({
         end
     end
 })
+
 SharkTab:CreateSection("Unmapped Pets Cache")
 PendingPetsLabel = SharkTab:CreateLabel("Pending Unmapped Pets: 0")
 SharkTab:CreateButton({
@@ -836,15 +921,18 @@ SharkTab:CreateButton({
                 UpdatePendingCounter()
                 saveData()
             end
+            
             -- Phase 2: Sync remaining pets
             local qList = {}
             for base in pairs(pendingUnmappedSet) do table.insert(qList, base) end
+            
             if #qList == 0 then
                 Rayfield:Notify({Title = "Done", Content = "No pets left to map (all already in DB)", Duration = 4})
                 isResyncing = false
                 SetStatus("Status: Idle", false)
                 return
             end
+            
             Rayfield:Notify({Title = "Syncing", Content = "Mapping " .. #qList .. " remaining pet(s)...", Duration = 4})
             local totalAdded = 0
             for i, base in ipairs(qList) do
@@ -860,6 +948,7 @@ SharkTab:CreateButton({
                 SetStatus("API Sync: " .. i .. "/" .. #qList .. " (" .. base .. ") - Added " .. thisAdded, true)
                 task.wait(apiSyncDelay)
             end
+            
             saveData()
             refreshUI()
             local remaining = 0 for _ in pairs(pendingUnmappedSet) do remaining = remaining + 1 end
@@ -873,11 +962,13 @@ SharkTab:CreateButton({
         end)
     end
 })
+
 -- ===========================
 -- DATABASE TAB
 -- ===========================
 DBStatsLabel = DBTab:CreateLabel("Database: Loading...")
 DBTab:CreateButton({Name = "Refresh Stats", Callback = refreshUI})
+
 local ResyncLabel = DBTab:CreateLabel("Background Task Status: Idle")
 DBTab:CreateSection("API Sync Settings")
 DBTab:CreateSlider({
@@ -892,6 +983,7 @@ DBTab:CreateSlider({
         saveData()
     end,
 })
+
 DBTab:CreateSection("Maintenance")
 DBTab:CreateButton({
     Name = "Resync Entire Database (Full API Fetch)",
@@ -923,6 +1015,7 @@ DBTab:CreateButton({
     end
 })
 DBTab:CreateButton({ Name = "Stop Tasks", Callback = function() isResyncing = false end })
+
 -- ===========================
 -- HISTORY TAB
 -- ===========================
@@ -945,6 +1038,7 @@ HistoryTab:CreateButton({
         Rayfield:Notify({Title = "Cleared!", Content = "Scan history has been wiped. You can now scan everyone again.", Duration = 4})
     end
 })
+
 -- ===========================
 -- MISC TAB (Cleaned Up Extras)
 -- ===========================
@@ -973,11 +1067,13 @@ MiscTab:CreateButton({
         end
     end
 })
+
 MiscTab:CreateSection("Minigames")
 MiscTab:CreateToggle({
     Name = "Auto Guess Pet (Minigame)", CurrentValue = AutoGuess,
     Callback = function(v) AutoGuess = v; saveData(); end
 })
+
 MiscTab:CreateSection("Exist Checker")
 local ExistBox = MiscTab:CreateLabel("Exists: Waiting...")
 local eN, eR, eX = "", "Normal", false
@@ -995,6 +1091,7 @@ MiscTab:CreateButton({
         end)
     end
 })
+
 -- Background Event Listeners
 Players.PlayerAdded:Connect(function(newPlayer)
     if autoScanNewJoins and not isScanning and (not skipAlreadyScanned or not scanHistory[newPlayer.Name]) then
@@ -1004,19 +1101,23 @@ Players.PlayerAdded:Connect(function(newPlayer)
         end)
     end
 end)
+
 RemoteEvent.OnClientEvent:Connect(function(action, data)
     if AutoGuess and action == "GuessPetStateChanged" and type(data) == "table" and data.State == "Guessing" then
         RemoteEvent:FireServer("GuessPet", data.CurrentPet)
     end
 end)
+
 -- Initialize Server Tracking
 totalServersJoinedLifetime = totalServersJoinedLifetime + 1
 saveData()
 UpdateStatsUI()
 UpdateAdminWebhook()
+
 -- UI is completely finished loading
-isUiLoaded = true 
+isUiLoaded = true
 UpdatePendingCounter()
+
 -- Auto Execute Initializer
 if autoScanOnJoin then
     task.spawn(function()
